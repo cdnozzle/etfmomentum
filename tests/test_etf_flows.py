@@ -115,3 +115,36 @@ def test_aggregate_flow_pct():
                       "flow_ytd": [10.0, -10.0], "flow_3m": [0.0, 0.0]})
     agg = ef.aggregate_flows(t, ["asset_class"])
     assert agg["flow_ytd_pct"].iloc[0] == 0.0 and agg["n_etfs"].iloc[0] == 2
+
+
+def vol_history(ticker, volumes, prices=None):
+    n = len(volumes)
+    prices = prices or [10.0] * n
+    return pd.DataFrame({"date": pd.bdate_range("2026-01-01", periods=n), "ticker": ticker,
+                         "close": prices, "adj_close": prices, "volume": volumes})
+
+
+def test_volume_spike_detected_against_prior_60_sessions():
+    h = vol_history("AAA", [100] * 60 + [250], prices=[10.0] * 60 + [11.0])
+    spikes = ef.volume_spikes(h, window=60, threshold=2.0, sessions=5)
+    assert len(spikes) == 1
+    row = spikes.iloc[0]
+    assert row["volume_ratio"] == pytest.approx(2.5)   # baseline excludes the spike day itself
+    assert row["day_return"] == pytest.approx(0.1)
+    assert row["dollar_volume"] == pytest.approx(2750.0)
+
+
+def test_volume_spike_threshold_and_scan_window():
+    h = pd.concat([
+        vol_history("BBB", [100] * 60 + [199]),             # 1.99x: below threshold
+        vol_history("CCC", [100] * 60 + [300] + [100] * 5),  # spike 6 sessions ago
+        vol_history("DDD", [100] * 30 + [500]),              # not enough history for a 60-session baseline
+    ])
+    assert ef.volume_spikes(h, sessions=5).empty
+    assert ef.volume_spikes(h, sessions=6)["ticker"].tolist() == ["CCC"]
+
+
+def test_latest_volume_ratio():
+    h = pd.concat([vol_history("AAA", [100] * 60 + [300]), vol_history("BBB", [100] * 10)])
+    r = ef.latest_volume_ratio(h)
+    assert r["AAA"] == pytest.approx(3.0) and pd.isna(r["BBB"])

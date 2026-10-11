@@ -214,7 +214,18 @@ def fetch_price_history(ticker, api_key, start, end):
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"])
-    return df.set_index("date")[["close", "adjusted_close"]].rename(columns={"adjusted_close": "adj_close"})
+    return df.set_index("date")[["close", "adjusted_close", "volume"]].rename(columns={"adjusted_close": "adj_close"})
+
+
+def fetch_many_price_histories(tickers, api_key, start, end=None, max_workers=8):
+    """Daily close / adj_close / volume for many tickers in long format (1 API call per ticker)."""
+    end = end or date.today().strftime("%Y-%m-%d")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = pool.map(lambda t: fetch_price_history(t, api_key, start, end).assign(ticker=t), tickers)
+    frames = [df.reset_index() for df in results if not df.empty]
+    if not frames:
+        return pd.DataFrame(columns=["date", "ticker", "close", "adj_close", "volume"])
+    return pd.concat(frames, ignore_index=True)
 
 
 # --- 2. Classification: asset class -> country / region -> sector / segment ---
@@ -374,7 +385,47 @@ def fill_missing_prices(snapshots, api_key):
     return snapshots
 
 
-# --- 4. Flow estimation ---
+# --- 4. Volume spikes ---
+def volume_spikes(history, window=60, threshold=2.0, sessions=5):
+    """
+    Sessions where volume exceeded `threshold` x its trailing `window`-session average.
+
+    The average covers the `window` sessions *before* each day, so a spike does not
+    dilute its own baseline. Only the last `sessions` sessions of each ticker are
+    scanned. Returns one row per spike with the volume ratio, the day's total return
+    and the dollar volume traded.
+    """
+    cols = ["ticker", "date", "volume", "avg_volume", "volume_ratio", "day_return", "dollar_volume"]
+    if history.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for ticker, g in history.sort_values("date").groupby("ticker"):
+        g = g.set_index("date")
+        avg = g["volume"].shift(1).rolling(window, min_periods=window).mean()
+        recent = pd.DataFrame({
+            "volume": g["volume"], "avg_volume": avg, "volume_ratio": g["volume"] / avg.replace(0, np.nan),
+            "day_return": g["adj_close"].pct_change(), "dollar_volume": g["close"] * g["volume"],
+        }).tail(sessions)
+        hits = recent[recent["volume_ratio"] >= threshold]
+        if not hits.empty:
+            rows.append(hits.reset_index().assign(ticker=ticker))
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(rows, ignore_index=True)[cols].sort_values("volume_ratio", ascending=False).reset_index(drop=True)
+
+
+def latest_volume_ratio(history, window=60):
+    """Latest session's volume / trailing `window`-session average, per ticker."""
+    if history.empty:
+        return pd.Series(dtype=float)
+    def ratio(g):
+        v = g.sort_values("date")["volume"]
+        avg = v.shift(1).rolling(window, min_periods=window).mean()
+        return v.iloc[-1] / avg.iloc[-1] if avg.iloc[-1] else np.nan
+    return history.groupby("ticker").apply(ratio, include_groups=False)
+
+
+# --- 5. Flow estimation ---
 def _price_factor(prev, cur):
     """
     Growth of one share's NAV between snapshots, excluding distributions.

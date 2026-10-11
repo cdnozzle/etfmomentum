@@ -5,6 +5,8 @@ Streamlit app (EODHD data) with two pages:
 - **ETF Momentum** (`etf_momentum.py`): 12-1 month and vol-adjusted momentum backtests on an ETF universe.
 - **ETF Flows** (`pages/1_ETF_Flows.py`): US ETF net flows YTD and over the last 3 months, grouped
   asset class → country / region → sector / segment (treemap, grouped tables, top movers, flow vs. return).
+  A **Volume spikes** tab flags ETFs whose session volume exceeded 2x (configurable) their average over the
+  prior 60 sessions, as a same-day flow signal (1 EODHD call per ETF).
 
 ```bash
 pip install -r requirements.txt

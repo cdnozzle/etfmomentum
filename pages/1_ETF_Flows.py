@@ -39,6 +39,11 @@ def load_window_returns(api_key, tickers, start):
     return ef.window_returns(api_key, list(tickers), start)
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner="Fetching daily volume history...")
+def load_volume_history(api_key, tickers, start):
+    return ef.fetch_many_price_histories(list(tickers), api_key, start)
+
+
 def fmt_usd(x):
     if pd.isna(x):
         return "n/a"
@@ -141,11 +146,15 @@ if run_button:
     for suffix in ("ytd", "3m"):
         table[f"flow_{suffix}_pct"] = table[f"flow_{suffix}"] / (table["aum"] - table[f"flow_{suffix}"])
 
+    # ~130 calendar days covers a 60-session baseline plus up to 20 sessions to scan
+    st.session_state["volume_history"] = load_volume_history(
+        api_key, tuple(table["ticker"]), (date.today() - pd.Timedelta(days=130)).strftime("%Y-%m-%d"))
     st.session_state["flow_table"] = table
     st.session_state["snapshot_range"] = (snapshots["date"].min(), snapshots["date"].max(), snapshots["date"].nunique())
     st.session_state["starts"] = starts
 
 table = st.session_state["flow_table"]
+volume_history = st.session_state["volume_history"]
 first_snap, last_snap, n_snap_dates = st.session_state["snapshot_range"]
 starts = st.session_state["starts"]
 
@@ -177,8 +186,8 @@ window = st.radio("Flow window", ["YTD", "3M"], horizontal=True)
 sfx = window.lower()
 flow_col, pct_col, ret_col = f"flow_{sfx}", f"flow_{sfx}_pct", f"ret_{sfx}"
 
-tab_tree, tab_class, tab_geo, tab_sector, tab_movers, tab_all = st.tabs(
-    ["Hierarchy map", "By asset class", "By country / region", "By sector / segment", "Top movers", "All ETFs"])
+tab_tree, tab_class, tab_geo, tab_sector, tab_movers, tab_volume, tab_all = st.tabs(
+    ["Hierarchy map", "By asset class", "By country / region", "By sector / segment", "Top movers", "Volume spikes", "All ETFs"])
 
 with tab_tree:
     st.markdown(f"Box size = AUM, colour = {window} net flow as % of starting AUM "
@@ -256,9 +265,70 @@ with tab_movers:
         fig.add_vline(x=0, line_color="#999", line_width=1)
         st.plotly_chart(fig, width="stretch")
 
+with tab_volume:
+    st.markdown("Sessions where an ETF traded well above its normal volume. Heavy volume often accompanies "
+                "creations / redemptions, so spikes are an early, daily flow signal while the AUM history builds up.")
+    v1, v2, v3 = st.columns(3)
+    vol_threshold = v1.number_input("Volume / average at least", min_value=1.0, value=2.0, step=0.5)
+    vol_window = v2.number_input("Average over prior sessions", min_value=10, max_value=80, value=60, step=5)
+    vol_sessions = v3.slider("Sessions to scan", 1, 20, 5, help="1 = latest session only")
+    spikes = ef.volume_spikes(volume_history, window=int(vol_window), threshold=vol_threshold, sessions=vol_sessions)
+    spikes = spikes.merge(table[["ticker", "name", "asset_class", "geography", "sector", "aum", "flow_3m"]], on="ticker")
+    last_session = volume_history["date"].max() if not volume_history.empty else None
+    k1, k2, k3 = st.columns(3)
+    k1.metric("ETFs with a spike", f"{spikes['ticker'].nunique():,} of {len(table):,}")
+    k2.metric("Spikes on latest session", f"{(spikes['date'] == last_session).sum():,}")
+    k3.metric("Latest session", f"{last_session:%Y-%m-%d}" if last_session is not None else "n/a")
+    if spikes.empty:
+        st.info(f"No ETF traded above {vol_threshold:g}x its {vol_window}-session average volume in the last {vol_sessions} session(s).")
+    else:
+        top = spikes.drop_duplicates("ticker").head(25).sort_values("volume_ratio")
+        top_label = top["ticker"] + " (" + top["date"].dt.strftime("%m-%d") + ")"
+        fig = go.Figure(go.Bar(
+            y=top_label, x=top["volume_ratio"], orientation="h",
+            marker_color=np.where(top["day_return"] >= 0, INFLOW, OUTFLOW),
+            customdata=np.stack([top["name"], top["day_return"] * 100, top["dollar_volume"] / 1e6], axis=1),
+            hovertemplate="<b>%{y}</b> %{customdata[0]}<br>Volume %{x:.1f}x average<br>"
+                          "Day return %{customdata[1]:.2f}%<br>Traded $%{customdata[2]:,.0f}M<extra></extra>",
+        ))
+        fig.add_vline(x=vol_threshold, line_color="#999", line_width=1, line_dash="dot")
+        fig.update_layout(title="Largest volume spikes (blue = up day, red = down day)",
+                          xaxis_title=f"Volume / {vol_window}-session average", template="plotly_white",
+                          height=max(320, 28 * len(top) + 120), margin=dict(l=10, r=10, t=50, b=40), bargap=0.25)
+        c1, c2 = st.columns([3, 2])
+        c1.plotly_chart(fig, width="stretch")
+        with c2:
+            group = st.radio("Count spiking ETFs by", list(LEVELS), horizontal=True, key="vol_group")
+            per_etf = spikes.drop_duplicates("ticker")
+            counts = (per_etf.groupby(LEVELS[group])
+                      .agg(spiking_etfs=("ticker", "count"), up_days=("day_return", lambda r: int((r >= 0).sum())),
+                           dollar_volume=("dollar_volume", "sum"), tickers=("ticker", ", ".join))
+                      .sort_values("spiking_etfs", ascending=False).reset_index())
+            st.dataframe(counts, hide_index=True, width="stretch", column_config={
+                LEVELS[group]: group,
+                "spiking_etfs": st.column_config.NumberColumn("# ETFs"),
+                "up_days": st.column_config.NumberColumn("# up days"),
+                "dollar_volume": st.column_config.NumberColumn("$ traded", format="compact"),
+                "tickers": "Tickers",
+            })
+        st.dataframe(spikes[["date", "ticker", "name", "asset_class", "geography", "sector", "volume_ratio",
+                             "day_return", "volume", "avg_volume", "dollar_volume", "aum", "flow_3m"]],
+                     hide_index=True, width="stretch", column_config={
+                         "date": st.column_config.DateColumn("Date"),
+                         "asset_class": "Asset class", "geography": "Country / region", "sector": "Sector / segment",
+                         "volume_ratio": st.column_config.NumberColumn("Volume / avg", format="%.1fx"),
+                         "day_return": st.column_config.NumberColumn("Day return", format="percent"),
+                         "volume": st.column_config.NumberColumn("Volume", format="compact"),
+                         "avg_volume": st.column_config.NumberColumn(f"{vol_window}-session avg", format="compact"),
+                         "dollar_volume": st.column_config.NumberColumn("$ traded", format="compact"),
+                         "aum": st.column_config.NumberColumn("AUM ($)", format="compact"),
+                         "flow_3m": st.column_config.NumberColumn("Flow 3M ($)", format="compact"),
+                     })
+
 with tab_all:
     cols = ["ticker", "name", "asset_class", "geography", "sector", "aum", "flow_ytd", "flow_ytd_pct", "ret_ytd",
-            "flow_3m", "flow_3m_pct", "ret_3m", "expense_ratio", "issuer"]
+            "flow_3m", "flow_3m_pct", "ret_3m", "volume_ratio", "expense_ratio", "issuer"]
+    table["volume_ratio"] = table["ticker"].map(ef.latest_volume_ratio(volume_history))
     show = table[cols].sort_values(flow_col, ascending=False)
     st.dataframe(show, hide_index=True, width="stretch", height=700, column_config={
         "asset_class": "Asset class", "geography": "Country / region", "sector": "Sector / segment",
@@ -269,6 +339,8 @@ with tab_all:
         "flow_3m": st.column_config.NumberColumn("Flow 3M ($)", format="compact"),
         "flow_3m_pct": st.column_config.NumberColumn("Flow 3M %", format="percent"),
         "ret_3m": st.column_config.NumberColumn("Return 3M", format="percent"),
+        "volume_ratio": st.column_config.NumberColumn("Volume / 60d avg", format="%.1fx",
+                                                      help="Latest session's volume vs. the prior 60 sessions' average"),
         "expense_ratio": st.column_config.NumberColumn("Expense ratio", format="percent"),
     })
     st.download_button("Download table (CSV)", show.to_csv(index=False).encode("utf-8"),
